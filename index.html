@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>Title</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div id="canvas-wrap"><canvas id="flag-canvas"></canvas></div>
+
+<div class="panel">
+    <div class="buttons">
+        <button id="btn-pause">Pause</button>
+        <button id="btn-randomize">Randomize Flag</button>
+        <button id="btn-export">Export SVG</button>
+        <button id="btn-export-png">Export PNG</button>
+        <select id="sel-shape">
+            <option value="Original">Original Stars</option>
+            <option value="Circle">Circle</option>
+            <option value="Triangle">Triangle</option>
+            <option value="Square">Square</option>
+            <option value="Diamond">Diamond</option>
+            <option value="Pentagon">Pentagon</option>
+            <option value="Hexagon">Hexagon</option>
+            <option value="Octagon">Octagon</option>
+            <option value="Star 4-pt">Star 4-pt</option>
+            <option value="Star 6-pt">Star 6-pt</option>
+            <option value="Heart">Heart</option>
+            <option value="Ring">Ring</option>
+            <option value="Cross">Cross</option>
+            <option value="Arrow">Arrow</option>
+        </select>
+    </div>
+
+    <div class="section-label">Color</div>
+    <div class="controls">
+        <div class="control">
+            <label>Background</label>
+            <input type="color" id="cp-bg" value="#33393d">
+        </div>
+        <div class="control">
+            <label>Text / Outline</label>
+            <input type="color" id="cp-text" value="#ffffff">
+        </div>
+    </div>
+
+    <div class="section-label">Wave</div>
+    <div class="controls">
+        <div class="control">
+            <label>Amount <span id="lbl-amp">60</span> px</label>
+            <input type="range" id="sl-amp" min="0" max="280" value="40">
+        </div>
+        <div class="control">
+            <label>Speed <span id="lbl-speed">2.0</span></label>
+            <input type="range" id="sl-speed" min="-8" max="8" value="2" step="0.1">
+        </div>
+        <div class="control">
+            <label>Frequency <span id="lbl-freq">2.0</span></label>
+            <input type="range" id="sl-freq" min="0.5" max="8" value="1.5" step="0.5">
+        </div>
+        <div class="control">
+            <label>Wind Angle <span id="lbl-angle">0</span>°</label>
+            <input type="range" id="sl-angle" min="0" max="359" value="0">
+        </div>
+    </div>
+
+    <div class="section-label">Deformation</div>
+    <div class="controls">
+        <div class="control">
+            <label>Chaos <span id="lbl-chaos">0.30</span></label>
+            <input type="range" id="sl-chaos" min="0" max="1" value="0.05" step="0.05">
+        </div>
+        <div class="control">
+            <label>H Fold <span id="lbl-hfold">0</span> px</label>
+            <input type="range" id="sl-hfold" min="0" max="280" value="0">
+        </div>
+        <div class="control">
+            <label>V Fold <span id="lbl-vfold">0</span> px</label>
+            <input type="range" id="sl-vfold" min="0" max="280" value="0">
+        </div>
+        <div class="control">
+            <label>Droop <span id="lbl-droop">0</span> px</label>
+            <input type="range" id="sl-droop" min="-200" max="200" value="0">
+        </div>
+        <div class="control">
+            <label>Crinkle <span id="lbl-crinkle">0.00</span></label>
+            <input type="range" id="sl-crinkle" min="0" max="1" value="0" step="0.05">
+        </div>
+    </div>
+
+    <div class="section-label">Visual</div>
+    <div class="controls">
+        <div class="control">
+            <label>Shading <span id="lbl-shading">0.50</span></label>
+            <input type="range" id="sl-shading" min="0" max="1" value="0.35" step="0.05">
+        </div>
+        <div class="control">
+            <label>Perspective <span id="lbl-persp">0.00</span></label>
+            <input type="range" id="sl-persp" min="-0.9" max="0.9" value="0" step="0.05">
+        </div>
+        <div class="control">
+            <label>Outline <span id="lbl-outline">2.0</span> px</label>
+            <input type="range" id="sl-outline" min="0" max="5" value="2" step="0.5">
+        </div>
+        <div class="control">
+            <label>Flag Dither</label>
+            <select id="sel-flag-dither">
+                <option value="none">None</option>
+                <option value="2">2×2 Bayer</option>
+                <option value="4">4×4 Bayer</option>
+                <option value="8">8×8 Bayer</option>
+                <option value="dot4">Clustered Dot</option>
+                <option value="hlines">H Lines</option>
+                <option value="dlines">Diagonal</option>
+            </select>
+        </div>
+        <div class="control">
+            <label>Flag Levels <span id="lbl-flaglevels">4</span></label>
+            <input type="range" id="sl-flaglevels" min="2" max="16" value="4" step="1">
+        </div>
+        <div class="control">
+            <label>Shadow Dither</label>
+            <select id="sel-shadow-dither">
+                <option value="none">None</option>
+                <option value="2">2×2 Bayer</option>
+                <option value="4">4×4 Bayer</option>
+                <option value="8">8×8 Bayer</option>
+                <option value="dot4">Clustered Dot</option>
+                <option value="hlines">H Lines</option>
+                <option value="dlines">Diagonal</option>
+            </select>
+        </div>
+        <div class="control">
+            <label>Shadow Color</label>
+            <input type="color" id="cp-shadow-color" value="#000000">
+        </div>
+        <div class="control">
+            <label>Outline Dither</label>
+            <select id="sel-outline-dither">
+                <option value="none">None</option>
+                <option value="2">2×2 Bayer</option>
+                <option value="4">4×4 Bayer</option>
+                <option value="8">8×8 Bayer</option>
+                <option value="dot4">Clustered Dot</option>
+                <option value="hlines">H Lines</option>
+                <option value="dlines">Diagonal</option>
+            </select>
+        </div>
+        <div class="control">
+            <label>Dither Density <span id="lbl-dintensity">1.0</span></label>
+            <input type="range" id="sl-dintensity" min="0.1" max="2.0" value="1.0" step="0.1">
+        </div>
+    </div>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
