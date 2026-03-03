@@ -13,8 +13,28 @@ src.width    = SRC_W;
 src.height   = SRC_H;
 const srcCtx = src.getContext('2d');
 
+// Two-gate readiness: state restore only runs after BOTH img and svgText are ready,
+// so img.onload can't overwrite srcCtx after reloadSVG has already run.
+let imgLoaded         = false;
+let pendingStateHash  = new URLSearchParams(location.search).get('s');
+
+function onBothReady() {
+    if (!imgLoaded || !svgText) return;
+    if (pendingStateHash) {
+        // Pause before applying so reloadSVG's tmp.onload calls frame()
+        cancelAnimationFrame(rafId);
+        rafId = null;
+        paused = true;
+        pauseBtn.textContent = 'Play';
+        pauseBtn.classList.add('active');
+        applyStateHash(pendingStateHash);
+        document.getElementById('hash-input').value = pendingStateHash;
+        pendingStateHash = null;
+    }
+}
+
 const img = new Image(2099, 1399);
-img.onload  = () => { srcCtx.drawImage(img, 0, 0, SRC_W, SRC_H); startAnimation(); };
+img.onload  = () => { srcCtx.drawImage(img, 0, 0, SRC_W, SRC_H); startAnimation(); imgLoaded = true; onBothReady(); };
 img.onerror = () => console.error('Could not load tuebor-flag-example.svg');
 img.src     = 'tuebor-flag-example.svg';
 
@@ -35,6 +55,72 @@ Object.keys(FMT).forEach(id => {
     el.addEventListener('input', () => { lbl.textContent = FMT[id](+el.value); if (paused) frame(); });
 });
 const v = id => parseFloat(document.getElementById('sl-' + id).value);
+
+// ── state hash encode / decode ─────────────────────────────────────────────────
+// Encodes all controls into a compact base64url string that can be pasted into
+// the URL (?s=…) to restore the exact same flag state.
+const STATE_SCHEMA = [
+    { id: 'amp',                type: 'slider' },
+    { id: 'speed',              type: 'slider' },
+    { id: 'freq',               type: 'slider' },
+    { id: 'angle',              type: 'slider' },
+    { id: 'chaos',              type: 'slider' },
+    { id: 'hfold',              type: 'slider' },
+    { id: 'vfold',              type: 'slider' },
+    { id: 'droop',              type: 'slider' },
+    { id: 'crinkle',            type: 'slider' },
+    { id: 'shading',            type: 'slider' },
+    { id: 'persp',              type: 'slider' },
+    { id: 'outline',            type: 'slider' },
+    { id: 'flaglevels',         type: 'slider' },
+    { id: 'dintensity',         type: 'slider' },
+    { id: 'sel-flag-dither',    type: 'select' },
+    { id: 'sel-shadow-dither',  type: 'select' },
+    { id: 'sel-outline-dither', type: 'select' },
+    { id: 'sel-shape',          type: 'select' },
+    { id: 'cp-bg',              type: 'color'  },
+    { id: 'cp-text',            type: 'color'  },
+    { id: 'cp-shadow-color',    type: 'color'  },
+];
+
+function encodeStateHash() {
+    const vals = STATE_SCHEMA.map(({ id, type }) =>
+        type === 'slider'
+            ? parseFloat(document.getElementById('sl-' + id).value)
+            : document.getElementById(id).value
+    );
+    vals.push(parseFloat(time.toFixed(4))); // preserve wave position
+    return btoa(JSON.stringify(vals))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function applyStateHash(encoded) {
+    let vals;
+    try {
+        const b64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+        vals = JSON.parse(atob(b64 + '='.repeat((4 - b64.length % 4) % 4)));
+    } catch { return false; }
+    if (!Array.isArray(vals) || vals.length < STATE_SCHEMA.length) return false;
+    STATE_SCHEMA.forEach(({ id, type }, i) => {
+        const val = vals[i];
+        if (type === 'slider') {
+            const el = document.getElementById('sl-' + id);
+            if (!el) return;
+            el.value = val;
+            const lbl = document.getElementById('lbl-' + id);
+            if (lbl) lbl.textContent = FMT[id](val);
+        } else {
+            const el = document.getElementById(id);
+            if (el) el.value = val;
+        }
+    });
+    currentBgColor   = document.getElementById('cp-bg').value;
+    currentTextColor = document.getElementById('cp-text').value;
+    currentShape     = document.getElementById('sel-shape').value;
+    if (vals.length > STATE_SCHEMA.length) time = vals[STATE_SCHEMA.length];
+    if (svgText) reloadSVG();
+    return true;
+}
 
 // ── mesh constants ────────────────────────────────────────────────────────────
 const COLS = 52;
@@ -183,26 +269,27 @@ function buildGrid(flagW, flagH, t, amp, freq, angle, chaos, hfold, vfold, droop
     return grid;
 }
 
-// ── affine triangle renderer ──────────────────────────────────────────────────
-// Solves for the 2-D affine matrix M such that M·[u,v,1]ᵀ = [sx,sy,1]ᵀ for
-// three known correspondences, clips to the triangle, then maps the source
-// canvas through M so only the correct texture region is visible.
-function drawTri(A, B, C) {
-    const denom = (A.u - C.u) * (B.v - C.v) - (B.u - C.u) * (A.v - C.v);
-    if (Math.abs(denom) < 0.001) return;
+// ── affine quad renderer ───────────────────────────────────────────────────────
+// One draw call per mesh cell instead of two triangles, exploiting the fact that
+// the UV grid is axis-aligned so the affine coefficients simplify to simple
+// differences. p11 is included only in the clip quad; the affine is derived
+// from p00/p10/p01 (parallelogram approximation — sub-pixel error).
+function drawQuad(p00, p10, p11, p01) {
+    const du = p10.u - p00.u;
+    const dv = p01.v - p00.v;
+    if (Math.abs(du * dv) < 0.001) return;
 
-    const a = ((A.sx - C.sx) * (B.v - C.v) - (B.sx - C.sx) * (A.v - C.v)) / denom;
-    const b = ((A.sy - C.sy) * (B.v - C.v) - (B.sy - C.sy) * (A.v - C.v)) / denom;
-    const c = ((A.u  - C.u ) * (B.sx - C.sx) - (B.u - C.u) * (A.sx - C.sx)) / denom;
-    const d = ((A.u  - C.u ) * (B.sy - C.sy) - (B.u - C.u) * (A.sy - C.sy)) / denom;
-    const e = A.sx - a * A.u - c * A.v;
-    const f = A.sy - b * A.u - d * A.v;
+    const a = (p10.sx - p00.sx) / du,  b = (p10.sy - p00.sy) / du;
+    const c = (p01.sx - p00.sx) / dv,  d = (p01.sy - p00.sy) / dv;
+    const e = p00.sx - a * p00.u - c * p00.v;
+    const f = p00.sy - b * p00.u - d * p00.v;
 
     ctx.save();
     ctx.beginPath();
-    ctx.moveTo(A.sx, A.sy);
-    ctx.lineTo(B.sx, B.sy);
-    ctx.lineTo(C.sx, C.sy);
+    ctx.moveTo(p00.sx, p00.sy);
+    ctx.lineTo(p10.sx, p10.sy);
+    ctx.lineTo(p11.sx, p11.sy);
+    ctx.lineTo(p01.sx, p01.sy);
     ctx.closePath();
     ctx.clip();
     ctx.transform(a, b, c, d, e, f);
@@ -211,9 +298,10 @@ function drawTri(A, B, C) {
 }
 
 // ── animation loop ────────────────────────────────────────────────────────────
-let time   = 0;
-let paused = false;
-let rafId  = null;
+let time          = 0;
+let paused        = false;
+let rafId         = null;
+let lastUrlUpdate = 0;
 
 const BASE_PAD = 48;
 
@@ -266,8 +354,7 @@ function frame() {
             const p10 = grid[r    ][c + 1];
             const p01 = grid[r + 1][c    ];
             const p11 = grid[r + 1][c + 1];
-            drawTri(p00, p10, p11);
-            drawTri(p00, p11, p01);
+            drawQuad(p00, p10, p11, p01);
         }
     }
 
@@ -412,6 +499,15 @@ function frame() {
         }
     }
 
+    // ── sync URL and hash input with current state (throttled to ~2×/sec) ────
+    const nowMs = Date.now();
+    if (nowMs - lastUrlUpdate > 500) {
+        const hash = encodeStateHash();
+        try { history.replaceState(null, '', '?s=' + hash); } catch {}
+        document.getElementById('hash-input').value = hash;
+        lastUrlUpdate = nowMs;
+    }
+
     if (!paused) {
         time += speed * 0.022;
         rafId = requestAnimationFrame(frame);
@@ -442,10 +538,12 @@ function getTimestamp() {
 }
 
 function getSettingsText(displayTime) {
-    const lbl = id => document.getElementById('lbl-' + id).textContent;
+    const lbl  = id => document.getElementById('lbl-' + id).textContent;
+    const hash = encodeStateHash();
     return [
         'TUEBOR FLAG EXPORT',
         `Exported: ${displayTime}`,
+        `State:    ${hash}`,
         '',
         'WAVE',
         `  Amount:       ${lbl('amp')} px`,
@@ -492,7 +590,126 @@ function downloadBlob(filename, blob) {
     setTimeout(() => URL.revokeObjectURL(url), 200);
 }
 
-// ── export SVG ────────────────────────────────────────────────────────────────
+// ── export SVG (true vector) ───────────────────────────────────────────────────
+// Builds a fully vector SVG by embedding the flag source as SVG paths in <defs>,
+// then mapping each mesh triangle onto screen space via a <clipPath> + affine
+// <use> transform. Shading and outline are also emitted as vector elements.
+// Dithering effects are raster-only and are omitted from this export.
+function buildVectorSVG() {
+    const flagW   = wrap.clientWidth  * 0.75;
+    const flagH   = wrap.clientHeight * 0.75;
+    const amp     = v('amp');
+    const freq    = v('freq');
+    const angle   = v('angle');
+    const chaos   = v('chaos');
+    const hfold   = v('hfold');
+    const vfold   = v('vfold');
+    const droop   = v('droop');
+    const crinkle = v('crinkle');
+    const shading = v('shading');
+    const persp   = v('persp');
+    const outline = v('outline');
+
+    const hPad = Math.ceil(amp + hfold + crinkle * 20) + BASE_PAD;
+    const vPad = Math.ceil(amp + vfold + Math.abs(droop) + Math.abs(persp) * flagH / 2 + crinkle * 20) + BASE_PAD;
+    const cw   = Math.round(flagW + hPad * 2);
+    const ch   = Math.round(flagH + vPad * 2);
+    const ox   = hPad;
+    const oy   = Math.round(ch / 2 - flagH / 2);
+
+    const grid     = buildGrid(flagW, flagH, time, amp, freq, angle, chaos, hfold, vfold, droop, crinkle, persp, ox, oy);
+    const origArea = (flagW / COLS) * (flagH / ROWS);
+
+    // Strip outer <svg> wrapper so the flag paths can be embedded in <defs>.
+    // The flag SVG has viewBox="0 0 2099 1399"; we scale it to SRC_W×SRC_H UV space.
+    const svgContent = buildModifiedSVG().replace(/^<svg[^>]*>/, '').replace(/<\/svg>\s*$/, '');
+    const scaleX = (SRC_W / 2099).toFixed(8);
+    const scaleY = (SRC_H / 1399).toFixed(8);
+
+    const defs = [];
+    const body = [];
+
+    // ── flag source (scaled to UV space) ──────────────────────────────────────
+    defs.push(`<g id="flag-src" transform="scale(${scaleX},${scaleY})">${svgContent}</g>`);
+
+    // ── mesh quads ────────────────────────────────────────────────────────────
+    // One quad per cell instead of two triangles, halving the element count.
+    // The affine is derived from the three axis-aligned corners (p00, p10, p01);
+    // coefficients reduce to: a=(Δsx/Δu), c=(Δsx/Δv), b=(Δsy/Δu), d=(Δsy/Δv).
+    // The fourth corner (p11) is approximated by parallelogram completion —
+    // error is the non-affine residual of the quad, typically sub-pixel.
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            const p00 = grid[r    ][c    ];
+            const p10 = grid[r    ][c + 1];
+            const p01 = grid[r + 1][c    ];
+            const p11 = grid[r + 1][c + 1];
+
+            const du = p10.u - p00.u;
+            const dv = p01.v - p00.v;
+            if (Math.abs(du * dv) < 0.001) continue;
+
+            const ma = (p10.sx - p00.sx) / du;
+            const mb = (p10.sy - p00.sy) / du;
+            const mc = (p01.sx - p00.sx) / dv;
+            const md = (p01.sy - p00.sy) / dv;
+            const me = p00.sx - ma * p00.u - mc * p00.v;
+            const mf = p00.sy - mb * p00.u - md * p00.v;
+
+            const id  = `q${r * COLS + c}`;
+            const pts = `${p00.sx.toFixed(1)},${p00.sy.toFixed(1)} ${p10.sx.toFixed(1)},${p10.sy.toFixed(1)} ${p11.sx.toFixed(1)},${p11.sy.toFixed(1)} ${p01.sx.toFixed(1)},${p01.sy.toFixed(1)}`;
+            const mtx = `${ma.toFixed(5)},${mb.toFixed(5)},${mc.toFixed(5)},${md.toFixed(5)},${me.toFixed(1)},${mf.toFixed(1)}`;
+            defs.push(`<clipPath id="${id}"><polygon points="${pts}"/></clipPath>`);
+            body.push(`<g clip-path="url(#${id})"><use href="#flag-src" transform="matrix(${mtx})"/></g>`);
+        }
+    }
+
+    // ── shading (vector quads, no dithering) ──────────────────────────────────
+    if (shading > 0) {
+        const shadowColor = document.getElementById('cp-shadow-color').value;
+        for (let r = 0; r < ROWS; r++) {
+            for (let c = 0; c < COLS; c++) {
+                const p00 = grid[r    ][c    ];
+                const p10 = grid[r    ][c + 1];
+                const p01 = grid[r + 1][c    ];
+                const p11 = grid[r + 1][c + 1];
+                const ex = p10.sx - p00.sx, ey = p01.sx - p00.sx;
+                const fx = p10.sy - p00.sy, fy = p01.sy - p00.sy;
+                const ratio = (ex * fy - fx * ey) / origArea;
+                if (ratio < 0.99) {
+                    const alpha = (shading * Math.min(1, Math.max(0, 1 - ratio)) * 0.75).toFixed(3);
+                    const pts   = `${p00.sx.toFixed(1)},${p00.sy.toFixed(1)} ${p10.sx.toFixed(1)},${p10.sy.toFixed(1)} ${p11.sx.toFixed(1)},${p11.sy.toFixed(1)} ${p01.sx.toFixed(1)},${p01.sy.toFixed(1)}`;
+                    body.push(`<polygon fill="${shadowColor}" fill-opacity="${alpha}" points="${pts}"/>`);
+                }
+            }
+        }
+    }
+
+    // ── outline (clipped to outside of flag via evenodd compound path) ─────────
+    if (outline > 0) {
+        // Trace the flag perimeter as an SVG path string
+        let perimD = `M${grid[0][0].sx.toFixed(1)},${grid[0][0].sy.toFixed(1)}`;
+        for (let c = 1; c <= COLS; c++) perimD += ` L${grid[0][c].sx.toFixed(1)},${grid[0][c].sy.toFixed(1)}`;
+        for (let r = 1; r <= ROWS; r++) perimD += ` L${grid[r][COLS].sx.toFixed(1)},${grid[r][COLS].sy.toFixed(1)}`;
+        for (let c = COLS - 1; c >= 0; c--) perimD += ` L${grid[ROWS][c].sx.toFixed(1)},${grid[ROWS][c].sy.toFixed(1)}`;
+        for (let r = ROWS - 1; r >= 0; r--) perimD += ` L${grid[r][0].sx.toFixed(1)},${grid[r][0].sy.toFixed(1)}`;
+        perimD += ' Z';
+
+        // Clip region = full viewport minus flag interior (evenodd on compound path)
+        defs.push(`<clipPath id="outline-clip"><path clip-rule="evenodd" d="M0,0 H${cw} V${ch} H0 Z ${perimD}"/></clipPath>`);
+        body.push(`<g clip-path="url(#outline-clip)"><path fill="none" stroke="white" stroke-width="${(outline * 2).toFixed(1)}" stroke-linejoin="round" d="${perimD}"/></g>`);
+    }
+
+    return [
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${cw}" height="${ch}" viewBox="0 0 ${cw} ${ch}">`,
+        '<defs>',
+        ...defs,
+        '</defs>',
+        ...body,
+        '</svg>',
+    ].join('\n');
+}
+
 document.getElementById('btn-export').addEventListener('click', () => {
     const wasPlaying = !paused;
     if (wasPlaying) {
@@ -501,19 +718,11 @@ document.getElementById('btn-export').addEventListener('click', () => {
         pauseBtn.classList.add('active');
     }
 
-    const ts  = getTimestamp();
-    const w   = canvas.width;
-    const h   = canvas.height;
-    const png = canvas.toDataURL('image/png');
+    const ts        = getTimestamp();
+    const shortHash = encodeStateHash().slice(0, 8);
 
-    const svgStr = [
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">`,
-        `  <image href="${png}" width="${w}" height="${h}"/>`,
-        `</svg>`,
-    ].join('\n');
-
-    downloadBlob(`tuebor-flag_${ts.file}.svg`, new Blob([svgStr], { type: 'image/svg+xml' }));
-    downloadBlob(`tuebor-flag_${ts.file}.txt`, new Blob([getSettingsText(ts.display)], { type: 'text/plain' }));
+    downloadBlob(`tuebor-flag_${ts.file}_${shortHash}.svg`, new Blob([buildVectorSVG()], { type: 'image/svg+xml' }));
+    downloadBlob(`tuebor-flag_${ts.file}_${shortHash}.txt`, new Blob([getSettingsText(ts.display)], { type: 'text/plain' }));
 
     if (wasPlaying) {
         paused = false;
@@ -525,12 +734,13 @@ document.getElementById('btn-export').addEventListener('click', () => {
 
 // ── export PNG ────────────────────────────────────────────────────────────────
 document.getElementById('btn-export-png').addEventListener('click', () => {
-    const ts = getTimestamp();
-    downloadBlob(`tuebor-flag_${ts.file}.png`, new Blob(
+    const ts        = getTimestamp();
+    const shortHash = encodeStateHash().slice(0, 8);
+    downloadBlob(`tuebor-flag_${ts.file}_${shortHash}.png`, new Blob(
         [Uint8Array.from(atob(canvas.toDataURL('image/png').split(',')[1]), c => c.charCodeAt(0))],
         { type: 'image/png' }
     ));
-    downloadBlob(`tuebor-flag_${ts.file}.txt`, new Blob([getSettingsText(ts.display)], { type: 'text/plain' }));
+    downloadBlob(`tuebor-flag_${ts.file}_${shortHash}.txt`, new Blob([getSettingsText(ts.display)], { type: 'text/plain' }));
 });
 
 // ── star shape replacement ────────────────────────────────────────────────────
@@ -678,7 +888,49 @@ function applyShape(name) {
     reloadSVG();
 }
 
-fetch('tuebor-flag-example.svg').then(r => r.text()).then(t => { svgText = t; });
+fetch('tuebor-flag-example.svg').then(r => r.text()).then(t => {
+    svgText = t;
+    onBothReady();
+});
+
+// ── hash bar ──────────────────────────────────────────────────────────────────
+function loadFromHashInput() {
+    const input = document.getElementById('hash-input');
+    let hash = input.value.trim();
+    // Accept full URLs — extract the ?s= param if present
+    try { const p = new URL(hash).searchParams.get('s'); if (p) hash = p; } catch {}
+    if (!hash) return;
+    const ok = applyStateHash(hash);
+    if (ok) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+        paused = true;
+        pauseBtn.textContent = 'Play';
+        pauseBtn.classList.add('active');
+        try { history.replaceState(null, '', '?s=' + hash); } catch {}
+        input.classList.remove('invalid');
+    } else {
+        input.classList.add('invalid');
+        setTimeout(() => input.classList.remove('invalid'), 1000);
+    }
+}
+
+document.getElementById('btn-load-hash').addEventListener('click', loadFromHashInput);
+document.getElementById('hash-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') loadFromHashInput();
+});
+
+document.getElementById('btn-copy-link').addEventListener('click', () => {
+    const hash = encodeStateHash();
+    history.replaceState(null, '', '?s=' + hash);
+    document.getElementById('hash-input').value = hash;
+    lastUrlUpdate = Date.now();
+    navigator.clipboard.writeText(location.href).then(() => {
+        const btn = document.getElementById('btn-copy-link');
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = 'Copy Link'; }, 1500);
+    });
+});
 
 document.getElementById('sel-shape').addEventListener('change', e => {
     applyShape(e.target.value);
