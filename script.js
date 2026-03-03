@@ -269,26 +269,27 @@ function buildGrid(flagW, flagH, t, amp, freq, angle, chaos, hfold, vfold, droop
     return grid;
 }
 
-// ── affine triangle renderer ──────────────────────────────────────────────────
-// Solves for the 2-D affine matrix M such that M·[u,v,1]ᵀ = [sx,sy,1]ᵀ for
-// three known correspondences, clips to the triangle, then maps the source
-// canvas through M so only the correct texture region is visible.
-function drawTri(A, B, C) {
-    const denom = (A.u - C.u) * (B.v - C.v) - (B.u - C.u) * (A.v - C.v);
-    if (Math.abs(denom) < 0.001) return;
+// ── affine quad renderer ───────────────────────────────────────────────────────
+// One draw call per mesh cell instead of two triangles, exploiting the fact that
+// the UV grid is axis-aligned so the affine coefficients simplify to simple
+// differences. p11 is included only in the clip quad; the affine is derived
+// from p00/p10/p01 (parallelogram approximation — sub-pixel error).
+function drawQuad(p00, p10, p11, p01) {
+    const du = p10.u - p00.u;
+    const dv = p01.v - p00.v;
+    if (Math.abs(du * dv) < 0.001) return;
 
-    const a = ((A.sx - C.sx) * (B.v - C.v) - (B.sx - C.sx) * (A.v - C.v)) / denom;
-    const b = ((A.sy - C.sy) * (B.v - C.v) - (B.sy - C.sy) * (A.v - C.v)) / denom;
-    const c = ((A.u  - C.u ) * (B.sx - C.sx) - (B.u - C.u) * (A.sx - C.sx)) / denom;
-    const d = ((A.u  - C.u ) * (B.sy - C.sy) - (B.u - C.u) * (A.sy - C.sy)) / denom;
-    const e = A.sx - a * A.u - c * A.v;
-    const f = A.sy - b * A.u - d * A.v;
+    const a = (p10.sx - p00.sx) / du,  b = (p10.sy - p00.sy) / du;
+    const c = (p01.sx - p00.sx) / dv,  d = (p01.sy - p00.sy) / dv;
+    const e = p00.sx - a * p00.u - c * p00.v;
+    const f = p00.sy - b * p00.u - d * p00.v;
 
     ctx.save();
     ctx.beginPath();
-    ctx.moveTo(A.sx, A.sy);
-    ctx.lineTo(B.sx, B.sy);
-    ctx.lineTo(C.sx, C.sy);
+    ctx.moveTo(p00.sx, p00.sy);
+    ctx.lineTo(p10.sx, p10.sy);
+    ctx.lineTo(p11.sx, p11.sy);
+    ctx.lineTo(p01.sx, p01.sy);
     ctx.closePath();
     ctx.clip();
     ctx.transform(a, b, c, d, e, f);
@@ -353,8 +354,7 @@ function frame() {
             const p10 = grid[r    ][c + 1];
             const p01 = grid[r + 1][c    ];
             const p11 = grid[r + 1][c + 1];
-            drawTri(p00, p10, p11);
-            drawTri(p00, p11, p01);
+            drawQuad(p00, p10, p11, p01);
         }
     }
 
@@ -590,7 +590,126 @@ function downloadBlob(filename, blob) {
     setTimeout(() => URL.revokeObjectURL(url), 200);
 }
 
-// ── export SVG ────────────────────────────────────────────────────────────────
+// ── export SVG (true vector) ───────────────────────────────────────────────────
+// Builds a fully vector SVG by embedding the flag source as SVG paths in <defs>,
+// then mapping each mesh triangle onto screen space via a <clipPath> + affine
+// <use> transform. Shading and outline are also emitted as vector elements.
+// Dithering effects are raster-only and are omitted from this export.
+function buildVectorSVG() {
+    const flagW   = wrap.clientWidth  * 0.75;
+    const flagH   = wrap.clientHeight * 0.75;
+    const amp     = v('amp');
+    const freq    = v('freq');
+    const angle   = v('angle');
+    const chaos   = v('chaos');
+    const hfold   = v('hfold');
+    const vfold   = v('vfold');
+    const droop   = v('droop');
+    const crinkle = v('crinkle');
+    const shading = v('shading');
+    const persp   = v('persp');
+    const outline = v('outline');
+
+    const hPad = Math.ceil(amp + hfold + crinkle * 20) + BASE_PAD;
+    const vPad = Math.ceil(amp + vfold + Math.abs(droop) + Math.abs(persp) * flagH / 2 + crinkle * 20) + BASE_PAD;
+    const cw   = Math.round(flagW + hPad * 2);
+    const ch   = Math.round(flagH + vPad * 2);
+    const ox   = hPad;
+    const oy   = Math.round(ch / 2 - flagH / 2);
+
+    const grid     = buildGrid(flagW, flagH, time, amp, freq, angle, chaos, hfold, vfold, droop, crinkle, persp, ox, oy);
+    const origArea = (flagW / COLS) * (flagH / ROWS);
+
+    // Strip outer <svg> wrapper so the flag paths can be embedded in <defs>.
+    // The flag SVG has viewBox="0 0 2099 1399"; we scale it to SRC_W×SRC_H UV space.
+    const svgContent = buildModifiedSVG().replace(/^<svg[^>]*>/, '').replace(/<\/svg>\s*$/, '');
+    const scaleX = (SRC_W / 2099).toFixed(8);
+    const scaleY = (SRC_H / 1399).toFixed(8);
+
+    const defs = [];
+    const body = [];
+
+    // ── flag source (scaled to UV space) ──────────────────────────────────────
+    defs.push(`<g id="flag-src" transform="scale(${scaleX},${scaleY})">${svgContent}</g>`);
+
+    // ── mesh quads ────────────────────────────────────────────────────────────
+    // One quad per cell instead of two triangles, halving the element count.
+    // The affine is derived from the three axis-aligned corners (p00, p10, p01);
+    // coefficients reduce to: a=(Δsx/Δu), c=(Δsx/Δv), b=(Δsy/Δu), d=(Δsy/Δv).
+    // The fourth corner (p11) is approximated by parallelogram completion —
+    // error is the non-affine residual of the quad, typically sub-pixel.
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            const p00 = grid[r    ][c    ];
+            const p10 = grid[r    ][c + 1];
+            const p01 = grid[r + 1][c    ];
+            const p11 = grid[r + 1][c + 1];
+
+            const du = p10.u - p00.u;
+            const dv = p01.v - p00.v;
+            if (Math.abs(du * dv) < 0.001) continue;
+
+            const ma = (p10.sx - p00.sx) / du;
+            const mb = (p10.sy - p00.sy) / du;
+            const mc = (p01.sx - p00.sx) / dv;
+            const md = (p01.sy - p00.sy) / dv;
+            const me = p00.sx - ma * p00.u - mc * p00.v;
+            const mf = p00.sy - mb * p00.u - md * p00.v;
+
+            const id  = `q${r * COLS + c}`;
+            const pts = `${p00.sx.toFixed(1)},${p00.sy.toFixed(1)} ${p10.sx.toFixed(1)},${p10.sy.toFixed(1)} ${p11.sx.toFixed(1)},${p11.sy.toFixed(1)} ${p01.sx.toFixed(1)},${p01.sy.toFixed(1)}`;
+            const mtx = `${ma.toFixed(5)},${mb.toFixed(5)},${mc.toFixed(5)},${md.toFixed(5)},${me.toFixed(1)},${mf.toFixed(1)}`;
+            defs.push(`<clipPath id="${id}"><polygon points="${pts}"/></clipPath>`);
+            body.push(`<g clip-path="url(#${id})"><use href="#flag-src" transform="matrix(${mtx})"/></g>`);
+        }
+    }
+
+    // ── shading (vector quads, no dithering) ──────────────────────────────────
+    if (shading > 0) {
+        const shadowColor = document.getElementById('cp-shadow-color').value;
+        for (let r = 0; r < ROWS; r++) {
+            for (let c = 0; c < COLS; c++) {
+                const p00 = grid[r    ][c    ];
+                const p10 = grid[r    ][c + 1];
+                const p01 = grid[r + 1][c    ];
+                const p11 = grid[r + 1][c + 1];
+                const ex = p10.sx - p00.sx, ey = p01.sx - p00.sx;
+                const fx = p10.sy - p00.sy, fy = p01.sy - p00.sy;
+                const ratio = (ex * fy - fx * ey) / origArea;
+                if (ratio < 0.99) {
+                    const alpha = (shading * Math.min(1, Math.max(0, 1 - ratio)) * 0.75).toFixed(3);
+                    const pts   = `${p00.sx.toFixed(1)},${p00.sy.toFixed(1)} ${p10.sx.toFixed(1)},${p10.sy.toFixed(1)} ${p11.sx.toFixed(1)},${p11.sy.toFixed(1)} ${p01.sx.toFixed(1)},${p01.sy.toFixed(1)}`;
+                    body.push(`<polygon fill="${shadowColor}" fill-opacity="${alpha}" points="${pts}"/>`);
+                }
+            }
+        }
+    }
+
+    // ── outline (clipped to outside of flag via evenodd compound path) ─────────
+    if (outline > 0) {
+        // Trace the flag perimeter as an SVG path string
+        let perimD = `M${grid[0][0].sx.toFixed(1)},${grid[0][0].sy.toFixed(1)}`;
+        for (let c = 1; c <= COLS; c++) perimD += ` L${grid[0][c].sx.toFixed(1)},${grid[0][c].sy.toFixed(1)}`;
+        for (let r = 1; r <= ROWS; r++) perimD += ` L${grid[r][COLS].sx.toFixed(1)},${grid[r][COLS].sy.toFixed(1)}`;
+        for (let c = COLS - 1; c >= 0; c--) perimD += ` L${grid[ROWS][c].sx.toFixed(1)},${grid[ROWS][c].sy.toFixed(1)}`;
+        for (let r = ROWS - 1; r >= 0; r--) perimD += ` L${grid[r][0].sx.toFixed(1)},${grid[r][0].sy.toFixed(1)}`;
+        perimD += ' Z';
+
+        // Clip region = full viewport minus flag interior (evenodd on compound path)
+        defs.push(`<clipPath id="outline-clip"><path clip-rule="evenodd" d="M0,0 H${cw} V${ch} H0 Z ${perimD}"/></clipPath>`);
+        body.push(`<g clip-path="url(#outline-clip)"><path fill="none" stroke="white" stroke-width="${(outline * 2).toFixed(1)}" stroke-linejoin="round" d="${perimD}"/></g>`);
+    }
+
+    return [
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${cw}" height="${ch}" viewBox="0 0 ${cw} ${ch}">`,
+        '<defs>',
+        ...defs,
+        '</defs>',
+        ...body,
+        '</svg>',
+    ].join('\n');
+}
+
 document.getElementById('btn-export').addEventListener('click', () => {
     const wasPlaying = !paused;
     if (wasPlaying) {
@@ -601,17 +720,8 @@ document.getElementById('btn-export').addEventListener('click', () => {
 
     const ts        = getTimestamp();
     const shortHash = encodeStateHash().slice(0, 8);
-    const w   = canvas.width;
-    const h   = canvas.height;
-    const png = canvas.toDataURL('image/png');
 
-    const svgStr = [
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">`,
-        `  <image href="${png}" width="${w}" height="${h}"/>`,
-        `</svg>`,
-    ].join('\n');
-
-    downloadBlob(`tuebor-flag_${ts.file}_${shortHash}.svg`, new Blob([svgStr], { type: 'image/svg+xml' }));
+    downloadBlob(`tuebor-flag_${ts.file}_${shortHash}.svg`, new Blob([buildVectorSVG()], { type: 'image/svg+xml' }));
     downloadBlob(`tuebor-flag_${ts.file}_${shortHash}.txt`, new Blob([getSettingsText(ts.display)], { type: 'text/plain' }));
 
     if (wasPlaying) {
